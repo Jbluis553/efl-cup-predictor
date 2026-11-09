@@ -2,7 +2,6 @@ name: Scheduled Retrain
 
 on:
   schedule:
-    # Cada lunes a las 06:00 UTC (después del fin de semana de partidos)
     - cron: "0 6 * * 1"
   workflow_dispatch:
     inputs:
@@ -45,10 +44,4 @@ jobs:
             models/*.joblib
             models/features.json
             models/backtest_*.csv
-          retention-days: 90
-
-      - name: Notify (optional)
-        if: always()
-        run: |
-          echo "Retrain completed with status: ${{ job.status }}"
-          # Aquí puedes añadir una notificación a Slack/Discord si lo deseas   
+          retention-days: 90   
