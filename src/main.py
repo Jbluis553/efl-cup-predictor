@@ -1,105 +1,98 @@
-import logging
 import argparse
 import json
+import logging
 from pathlib import Path
 
+import joblib
+
 from . import config
-from .data_fetcher import get_seasons, fetch_all_data
-from .feature_engineering import build_dataset
-from .model import train_1x2, train_over_under, train_btts, save_models
 from .backtest import backtest_1x2, backtest_over_under
+from .data_fetcher import fetch_all_data, get_seasons
+from .feature_engineering import build_dataset
+from .model import save_models, train_1x2, train_btts, train_over_under
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("main")
 
 
 def main():
     parser = argparse.ArgumentParser(description="EFL Cup ML Predictor")
-    parser.add_argument("--fetch-only", action="store_true", help="Solo descargar datos")
-    parser.add_argument("--train-only", action="store_true", help="Solo entrenar (usa datos existentes)")
-    parser.add_argument("--backtest-only", action="store_true", help="Solo backtest")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--fetch-only", action="store_true", help="Solo descargar datos")
+    mode.add_argument("--train-only", action="store_true", help="Solo entrenar con datos existentes")
+    mode.add_argument("--backtest-only", action="store_true", help="Solo ejecutar el backtest")
     args = parser.parse_args()
 
-    # 1. Fetch data
     if not args.train_only and not args.backtest_only:
         logger.info("=== STEP 1: Fetching data from TheStatsAPI ===")
         seasons = get_seasons()
-        # Tomar las últimas N temporadas
         seasons = seasons[-config.SEASONS:]
         fetch_all_data(seasons)
-
-    # 2. Build features
-    logger.info("=== STEP 2: Building feature matrix ===")
-    df = build_dataset()
-    logger.info(f"  Shape: {df.shape}")
-    logger.info(f"  Date range: {df['kickoff'].min()} → {df['kickoff'].max()}")
 
     if args.fetch_only:
         return
 
-    # 3. Train models
-    if not args.backtest_only:
-        logger.info("=== STEP 3: Training models ===")
+    logger.info("=== STEP 2: Building feature matrix ===")
+    df = build_dataset()
+    logger.info("  Shape: %s", df.shape)
+    if df["kickoff"].notna().any():
+        logger.info("  Date range: %s → %s", df["kickoff"].min(), df["kickoff"].max())
 
-        logger.info("  --- 1X2 Model ---")
-        results_1x2 = train_1x2(df)
-        for name, metrics in results_1x2.items():
-            if name != "final_models" and name != "features":
-                logger.info(f"  {name}: {metrics}")
-
-        logger.info("  --- Over/Under 2.5 ---")
-        results_ou = train_over_under(df)
-        logger.info(f"  OOF Accuracy: {results_ou['oof_accuracy']:.4f}, LogLoss: {results_ou['oof_log_loss']:.4f}")
-
-        logger.info("  --- BTTS ---")
-        results_btts = train_btts(df)
-        logger.info(f"  OOF Accuracy: {results_btts['oof_accuracy']:.4f}, LogLoss: {results_btts['oof_log_loss']:.4f}")
-
-        # Save
-        all_models = {
-            "1x2_home": results_1x2["final_models"]["home"],
-            "1x2_draw": results_1x2["final_models"]["draw"],
-            "1x2_away": results_1x2["final_models"]["away"],
-            "over_under": results_ou["model"],
-            "btts": results_btts["model"],
+    if args.backtest_only:
+        models_dir = Path(config.MODEL_DIR)
+        with (models_dir / "features.json").open(encoding="utf-8") as handle:
+            features = json.load(handle)
+        model_dict = {
+            "features": features,
+            "final_models": {
+                outcome: joblib.load(models_dir / f"1x2_{outcome}.joblib")
+                for outcome in ("home", "draw", "away")
+            },
         }
+        over_under_result = {
+            "features": features,
+            "model": joblib.load(models_dir / "over_under.joblib"),
+        }
+    else:
+        logger.info("=== STEP 3: Training models ===")
+        results_1x2 = train_1x2(df)
+        results_ou = train_over_under(df)
+        results_btts = train_btts(df)
+
+        all_models = {
+            f"1x2_{outcome}": model
+            for outcome, model in results_1x2["final_models"].items()
+        }
+        all_models.update({"over_under": results_ou["model"], "btts": results_btts["model"]})
         save_models(all_models)
 
-        # Save feature list
-        Path(config.MODEL_DIR).mkdir(parents=True, exist_ok=True)
-        with open(f"{config.MODEL_DIR}/features.json", "w") as f:
-            json.dump(results_1x2["features"], f, indent=2)
+        models_dir = Path(config.MODEL_DIR)
+        models_dir.mkdir(parents=True, exist_ok=True)
+        with (models_dir / "features.json").open("w", encoding="utf-8") as handle:
+            json.dump(results_1x2["features"], handle, indent=2)
+        model_dict = {
+            "features": results_1x2["features"],
+            "final_models": results_1x2["final_models"],
+        }
+        over_under_result = results_ou
 
-    # 4. Backtest
     if not args.train_only:
         logger.info("=== STEP 4: Backtesting ===")
-
-        # Reconstruir model dict para backtest
-        import joblib
-        model_dict = {
-            "features": results_1x2["features"] if not args.train_only else json.load(open(f"{config.MODEL_DIR}/features.json")),
-            "final_models": {
-                "home": joblib.load(f"{config.MODEL_DIR}/1x2_home.joblib"),
-                "draw": joblib.load(f"{config.MODEL_DIR}/1x2_draw.joblib"),
-                "away": joblib.load(f"{config.MODEL_DIR}/1x2_away.joblib"),
-            }
-        }
-
         bt_1x2 = backtest_1x2(df, model_dict, threshold=0.03)
         if not bt_1x2.empty:
-            logger.info(f"  1X2 Backtest: {bt_1x2.attrs['summary']}")
-            bt_1x2.to_csv(f"{config.MODEL_DIR}/backtest_1x2.csv", index=False)
+            logger.info("  1X2 Backtest: %s", bt_1x2.attrs.get("summary", {}))
+            bt_1x2.to_csv(Path(config.MODEL_DIR) / "backtest_1x2.csv", index=False)
 
-        bt_ou = backtest_over_under(df, results_ou, threshold=0.03)
+        bt_ou = backtest_over_under(df, over_under_result, threshold=0.03)
         if not bt_ou.empty:
-            logger.info(f"  O/U Backtest: {bt_ou.attrs['summary']}")
-            bt_ou.to_csv(f"{config.MODEL_DIR}/backtest_over_under.csv", index=False)
+            logger.info("  O/U Backtest: %s", bt_ou.attrs.get("summary", {}))
+            bt_ou.to_csv(Path(config.MODEL_DIR) / "backtest_over_under.csv", index=False)
 
     logger.info("=== DONE ===")
 
 
 if __name__ == "__main__":
-    main()   
+    main()
