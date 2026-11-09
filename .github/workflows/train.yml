@@ -1,0 +1,57 @@
+name: Train EFL Cup Model
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -e .
+
+      - name: Fetch data & Train
+        env:
+          THESTATSAPI_KEY: ${{ secrets.THESTATSAPI_KEY }}
+          COMPETITION_ID: comp_2504
+          SEASONS: 10
+        run: |
+          python -m src.main --fetch-only --train-only
+          python -m src.main --backtest-only
+
+      - name: Upload model artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: efl-cup-models
+          path: |
+            models/*.joblib
+            models/features.json
+            models/backtest_*.csv
+          retention-days: 30
+
+      - name: Upload data (for debugging)
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: efl-cup-data
+          path: data/
+          retention-days: 7   
