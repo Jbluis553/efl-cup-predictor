@@ -17,26 +17,35 @@ def backtest_1x2(df: pd.DataFrame, model_dict: dict, threshold: float = 0.05) ->
     """Backtest 1X2 predictions against closing Pinnacle prices."""
     features = model_dict["features"]
     X = df.reindex(columns=features, fill_value=0).fillna(0).values
-    results = []
+    outcomes = ("home", "draw", "away")
     models = model_dict["final_models"]
 
-    for i, (_, row) in enumerate(df.iterrows()):
-        probabilities = []
-        for outcome in ("home", "draw", "away"):
-            model = models[outcome]
-            classes = list(model.classes_)
-            probabilities.append(
-                float(model.predict_proba(X[i:i + 1])[0, classes.index(1)]) if 1 in classes else 0.0
-            )
-        total = sum(probabilities)
-        if not np.isfinite(total) or total <= 0:
-            continue
-        probabilities = [probability / total for probability in probabilities]
+    # Predict each outcome for the whole dataset at once. Calling LightGBM
+    # once per match creates thousands of tiny predictions and can make CI
+    # backtests appear to hang on larger historical datasets.
+    probabilities = []
+    for outcome in outcomes:
+        model = models[outcome]
+        classes = list(model.classes_)
+        if 1 in classes:
+            probabilities.append(model.predict_proba(X)[:, classes.index(1)])
+        else:
+            probabilities.append(np.zeros(len(df)))
+    probabilities = np.column_stack(probabilities)
+    totals = probabilities.sum(axis=1, keepdims=True)
+    probabilities = np.divide(
+        probabilities,
+        totals,
+        out=np.zeros_like(probabilities),
+        where=np.isfinite(totals) & (totals > 0),
+    )
 
+    results = []
+    for i, (_, row) in enumerate(df.iterrows()):
         actual = "home" if row["result_home"] == 1 else "draw" if row["result_draw"] == 1 else "away"
         best_bet = None
         best_edge = 0.0
-        for outcome, probability in zip(("home", "draw", "away"), probabilities):
+        for outcome, probability in zip(outcomes, probabilities[i]):
             odds = row.get(f"odds_pinnacle_{outcome}_last_seen", np.nan)
             if not _valid_odds(odds):
                 continue
