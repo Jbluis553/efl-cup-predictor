@@ -3,7 +3,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .config import config
+from . import config
 from .data_fetcher import get_seasons, fetch_all_data
 from .feature_engineering import build_dataset
 from .model import train_1x2, train_over_under, train_btts, save_models
