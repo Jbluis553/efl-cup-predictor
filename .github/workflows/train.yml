@@ -25,9 +25,7 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-          pip install -e .
+        run: pip install -r requirements.txt
 
       - name: Fetch data & Train
         env:
@@ -35,8 +33,15 @@ jobs:
           COMPETITION_ID: comp_2504
           SEASONS: 10
         run: |
-          python -m src.main --fetch-only --train-only
-          python -m src.main --backtest-only
+          python -m src.main --fetch-only
+          python -m src.main --train-only
+
+      - name: Backtest
+        env:
+          THESTATSAPI_KEY: ${{ secrets.THESTATSAPI_KEY }}
+          COMPETITION_ID: comp_2504
+          SEASONS: 10
+        run: python -m src.main --backtest-only
 
       - name: Upload model artifacts
         uses: actions/upload-artifact@v4
