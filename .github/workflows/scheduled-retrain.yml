@@ -1,0 +1,54 @@
+name: Scheduled Retrain
+
+on:
+  schedule:
+    # Cada lunes a las 06:00 UTC (después del fin de semana de partidos)
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      seasons:
+        description: "Number of seasons to use"
+        required: false
+        default: "10"
+
+env:
+  PYTHON_VERSION: "3.11"
+
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Full pipeline (fetch + train + backtest)
+        env:
+          THESTATSAPI_KEY: ${{ secrets.THESTATSAPI_KEY }}
+          COMPETITION_ID: comp_2504
+          SEASONS: ${{ github.event.inputs.seasons || '10' }}
+        run: python -m src.main
+
+      - name: Upload new model
+        uses: actions/upload-artifact@v4
+        with:
+          name: efl-cup-models-${{ github.run_number }}
+          path: |
+            models/*.joblib
+            models/features.json
+            models/backtest_*.csv
+          retention-days: 90
+
+      - name: Notify (optional)
+        if: always()
+        run: |
+          echo "Retrain completed with status: ${{ job.status }}"
+          # Aquí puedes añadir una notificación a Slack/Discord si lo deseas   
