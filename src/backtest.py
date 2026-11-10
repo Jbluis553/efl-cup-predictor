@@ -39,7 +39,8 @@ def _fair_probabilities(df: pd.DataFrame, selections: tuple, price_type: str,
     implied[valid] = 1.0 / odds[valid]
     totals = np.nansum(implied, axis=1)
     with np.errstate(invalid="ignore", divide="ignore"):
-        fair = implied / np.where(totals > 0, totals[:, None], np.nan)
+        denominator = np.where(totals[:, None] > 0, totals[:, None], np.nan)
+        fair = implied / denominator
     fair[~np.isfinite(fair)] = np.nan
     return fair
 
