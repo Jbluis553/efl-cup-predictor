@@ -50,12 +50,17 @@ def _positive_probability(model, X: np.ndarray) -> np.ndarray:
     return model.predict_proba(X)[:, classes.index(1)]
 
 
-def _oof_probabilities(X: np.ndarray, y: np.ndarray) -> np.ndarray:
+def _oof_probabilities(X: np.ndarray, y: np.ndarray, gap: int = 0) -> np.ndarray:
+    """Chronological out-of-fold probabilities (honest validation)."""
     if len(y) < 6:
         raise ValueError("At least 6 completed matches are required for time-series training")
-    splitter = TimeSeriesSplit(n_splits=min(5, len(y) - 1))
+    splitter = TimeSeriesSplit(n_splits=min(5, len(y) - 1), gap=gap)
     predictions = np.full(len(y), np.nan)
     for train_idx, valid_idx in splitter.split(X):
+        # Añadido: guarda contra folds cuyo train tiene una sola clase.
+        if len(np.unique(y[train_idx])) < 2:
+            logger.warning("Skipping OOF fold with a single class in the training window")
+            continue
         model = _classifier()
         model.fit(X[train_idx], y[train_idx])
         predictions[valid_idx] = _positive_probability(model, X[valid_idx])
@@ -93,58 +98,95 @@ def _prepare(df: pd.DataFrame, target: str) -> tuple[list[str], np.ndarray, np.n
     return features, X, y
 
 
+def train_binary_target(df: pd.DataFrame, target: str,
+                        features: list[str] | None = None) -> tuple:
+    """Train one binary model and return (model, features, oof_aligned, metrics).
+
+    oof_aligned has one probability per df row (NaN where the target was
+    invalid), which lets the backtest merge on match_id without leakage.
+    """
+    if target not in df:
+        raise ValueError(f"Missing target column: {target}")
+    features = features if features is not None else get_feature_columns(df)
+    if not features:
+        raise ValueError("No numeric pre-match features are available for training")
+    X = df[features].replace([np.inf, -np.inf], np.nan).fillna(0).to_numpy(dtype=float)
+    y = pd.to_numeric(df[target], errors="coerce").to_numpy()
+    valid = np.isfinite(y)
+    x_target, y_target = X[valid], y[valid].astype(int)
+    if not set(np.unique(y_target)).issubset({0, 1}) or len(np.unique(y_target)) < 2:
+        raise ValueError(f"Target {target} must contain both binary classes")
+    oof_valid = _oof_probabilities(x_target, y_target)
+    model = _classifier()
+    model.fit(x_target, y_target)
+    oof = np.full(len(df), np.nan)
+    oof[valid] = oof_valid
+    return model, features, oof, _binary_metrics(y_target, oof_valid)
+
+
 def train_1x2(df: pd.DataFrame) -> dict:
     """Train one-vs-rest 1X2 models with chronological validation."""
     features = get_feature_columns(df)
     if not features:
         raise ValueError("No numeric pre-match features are available for training")
-    X = df[features].replace([np.inf, -np.inf], np.nan).fillna(0).to_numpy(dtype=float)
-    results = {}
-    final_models = {}
+    results = {"features": features, "final_models": {}}
+    match_ids = df["match_id"] if "match_id" in df else np.arange(len(df))
+    kickoffs = df["kickoff"] if "kickoff" in df else [None] * len(df)
+    oof = pd.DataFrame({"match_id": match_ids, "kickoff": kickoffs})
     for outcome in ("home", "draw", "away"):
-        target = f"result_{outcome}"
-        y = pd.to_numeric(df[target], errors="coerce").to_numpy()
-        valid = np.isfinite(y)
-        x_target, y_target = X[valid], y[valid].astype(int)
-        if len(np.unique(y_target)) < 2:
-            raise ValueError(f"Target {target} must contain both binary classes")
-        oof = _oof_probabilities(x_target, y_target)
-        results[f"{outcome}_metrics"] = _binary_metrics(y_target, oof)
-        final_model = _classifier()
-        final_model.fit(x_target, y_target)
-        final_models[outcome] = final_model
-        logger.info("%s model metrics: %s", outcome, results[f"{outcome}_metrics"])
-    results["final_models"] = final_models
-    results["features"] = features
+        model, _, oof_col, metrics = train_binary_target(df, f"result_{outcome}", features)
+        results["final_models"][outcome] = model
+        results[f"{outcome}_metrics"] = metrics
+        oof[f"p_{outcome}"] = oof_col
+        logger.info("%s model metrics: %s", outcome, metrics)
+    results["oof"] = oof
     return results
 
 
 def train_over_under(df: pd.DataFrame) -> dict:
     """Train an Over/Under 2.5 goals model."""
-    features, X, y = _prepare(df, "over_2_5")
-    oof = _oof_probabilities(X, y)
-    model = _classifier()
-    model.fit(X, y)
+    model, features, oof, metrics = train_binary_target(df, "over_2_5")
     return {
         "model": model,
         "features": features,
-        "oof_accuracy": _binary_metrics(y, oof)["accuracy"],
-        "oof_log_loss": _binary_metrics(y, oof)["log_loss"],
+        "oof": oof,
+        "oof_accuracy": metrics["accuracy"],
+        "oof_log_loss": metrics["log_loss"],
     }
 
 
 def train_btts(df: pd.DataFrame) -> dict:
     """Train a both-teams-to-score model."""
-    features, X, y = _prepare(df, "btts")
-    oof = _oof_probabilities(X, y)
-    model = _classifier()
-    model.fit(X, y)
-    metrics = _binary_metrics(y, oof)
+    model, features, oof, metrics = train_binary_target(df, "btts")
     return {
         "model": model,
         "features": features,
+        "oof": oof,
         "oof_accuracy": metrics["accuracy"],
         "oof_log_loss": metrics["log_loss"],
+    }
+
+
+def train_all(df: pd.DataFrame) -> dict:
+    """Train every model and assemble a single OOF prediction table."""
+    results_1x2 = train_1x2(df)
+    results_ou = train_over_under(df)
+    results_btts = train_btts(df)
+    oof = results_1x2["oof"].copy()
+    oof["p_over"] = results_ou["oof"]
+    oof["p_btts"] = results_btts["oof"]
+    all_models = {
+        f"1x2_{outcome}": model
+        for outcome, model in results_1x2["final_models"].items()
+    }
+    all_models.update({"over_under": results_ou["model"], "btts": results_btts["model"]})
+    return {
+        "models": all_models,
+        "features": results_1x2["features"],
+        "oof": oof,
+        "results_1x2": results_1x2,
+        "results_over_under": results_ou,
+        "results_btts": results_btts,
     }
 
 
@@ -154,6 +196,16 @@ def save_models(models: dict, output_dir: str = config.MODEL_DIR) -> None:
     for name, model in models.items():
         joblib.dump(model, output / f"{name}.joblib")
     logger.info("Models saved to %s/", output)
+
+
+def save_oof_predictions(oof: pd.DataFrame, output_dir: str = config.MODEL_DIR) -> Path:
+    """Persist chronological OOF probabilities used by the honest backtest."""
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    path = output / config.OOF_FILE
+    oof.to_csv(path, index=False)
+    logger.info("OOF predictions saved to %s", path)
+    return path
 
 
 def predict_match(model_dict: dict, features: pd.DataFrame) -> dict:
