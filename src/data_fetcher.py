@@ -1,11 +1,19 @@
 import json
 import logging
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
 
 import requests
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 from . import config
 
@@ -18,10 +26,41 @@ _session.headers.update({
 })
 
 
+def _is_retryable_error(exc: BaseException) -> bool:
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return True
+    if isinstance(exc, requests.exceptions.HTTPError):
+        status = exc.response.status_code if exc.response is not None else None
+        return status == 408 or status == 429 or (status is not None and status >= 500)
+    return False
+
+
+_fallback_wait = wait_exponential(multiplier=2, min=2, max=60)
+
+
+def _wait_before_retry(retry_state: RetryCallState) -> float:
+    """Honor the API's Retry-After instruction, otherwise back off exponentially."""
+    exc = retry_state.outcome.exception() if retry_state.outcome else None
+    if isinstance(exc, requests.exceptions.HTTPError) and exc.response is not None:
+        retry_after = exc.response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(max(float(retry_after), 0), 300)
+            except ValueError:
+                try:
+                    retry_at = parsedate_to_datetime(retry_after)
+                    if retry_at.tzinfo is None:
+                        retry_at = retry_at.replace(tzinfo=timezone.utc)
+                    return min(max((retry_at - datetime.now(timezone.utc)).total_seconds(), 0), 300)
+                except (TypeError, ValueError, OverflowError):
+                    pass
+    return _fallback_wait(retry_state)
+
+
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=8),
-    retry=retry_if_exception_type((requests.exceptions.HTTPError, requests.exceptions.ConnectionError)),
+    stop=stop_after_attempt(5),
+    wait=_wait_before_retry,
+    retry=retry_if_exception(_is_retryable_error),
     reraise=True,
 )
 def _get(endpoint: str, params: Optional[dict] = None) -> dict:

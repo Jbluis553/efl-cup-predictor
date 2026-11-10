@@ -8,13 +8,13 @@ API_KEY = os.getenv("THESTATSAPI_KEY", "")
 COMPETITION_ID = os.getenv("COMPETITION_ID", "comp_2504")
 SEASONS = int(os.getenv("SEASONS", "10"))
 
-# Scale plan: 1,000 req/min
-RATE_LIMIT_RPM = 1000
-REQUEST_DELAY = 60 / RATE_LIMIT_RPM  # ~0.06s
+# Use a conservative request pace to avoid bursts against the API rate limit.
+RATE_LIMIT_RPM = 60
+REQUEST_DELAY = 60 / RATE_LIMIT_RPM
 
 BOOKMAKERS = ["pinnacle", "bet365", "paddy_power", "betfair_sportsbook", "kambi"]
 
 MARKETS = ["match_odds", "total_goals", "btts", "corners", "asian_handicap"]
 
 DATA_DIR = "data"
-MODEL_DIR = "models"   
+MODEL_DIR = "models"
